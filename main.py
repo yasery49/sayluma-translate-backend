@@ -252,13 +252,38 @@ def refresh_package_index_once() -> None:
         _package_index_ready = True
 
 
+def argos_translation_target_code(translation: object) -> Optional[str]:
+    for attr in ("code", "to_code", "target_code"):
+        code = getattr(translation, attr, None)
+        if isinstance(code, str) and code:
+            return code
+
+    for attr in ("to_lang", "target_lang", "target_language"):
+        language = getattr(translation, attr, None)
+        code = getattr(language, "code", None)
+        if isinstance(code, str) and code:
+            return code
+
+    for attr in ("cached_translation", "translation", "underlying_translation"):
+        nested = getattr(translation, attr, None)
+        if nested is not None and nested is not translation:
+            code = argos_translation_target_code(nested)
+            if code:
+                return code
+
+    return None
+
+
 @lru_cache(maxsize=128)
 def has_installed_pair(source_code: str, target_code: str) -> bool:
     installed_languages = argostranslate.translate.get_installed_languages()
     source_language = next((lang for lang in installed_languages if lang.code == source_code), None)
     if source_language is None:
         return False
-    return any(lang.code == target_code for lang in source_language.translations_from)
+    return any(
+        argos_translation_target_code(translation) == target_code
+        for translation in source_language.translations_from
+    )
 
 
 def install_pair_if_available(source_code: str, target_code: str) -> bool:
@@ -607,8 +632,10 @@ def installed_argos_pairs() -> list[str]:
     pairs: list[str] = []
     try:
         for source_language in argostranslate.translate.get_installed_languages():
-            for target_language in source_language.translations_from:
-                pairs.append(f"{source_language.code}:{target_language.code}")
+            for translation in source_language.translations_from:
+                target_code = argos_translation_target_code(translation)
+                if target_code:
+                    pairs.append(f"{source_language.code}:{target_code}")
     except Exception as error:
         print(f"Installed Argos pair check failed: {error}", flush=True)
     return sorted(set(pairs))
