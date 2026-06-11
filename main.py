@@ -7,6 +7,7 @@ from functools import lru_cache
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 import argostranslate.package
@@ -55,6 +56,18 @@ _marian_torch = None
 _marian_device = "cpu"
 
 
+@app.exception_handler(Exception)
+def unhandled_exception_handler(_, error: Exception) -> JSONResponse:
+    print(f"Unhandled backend error: {error}", flush=True)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "internal_error",
+            "detail": str(error),
+        },
+    )
+
+
 class TranslateRequest(BaseModel):
     text: Optional[str] = Field(default=None, max_length=2500)
     sourceText: Optional[str] = Field(default=None, max_length=2500)
@@ -70,6 +83,13 @@ class TranslateResponse(BaseModel):
     sourceLanguage: str
     targetLanguage: str
     pivotLanguage: Optional[str] = None
+
+
+class ArgosPreloadResult(BaseModel):
+    pair: str
+    installed: bool
+    status: str
+    detail: str = ""
 
 
 LANGUAGE_ALIASES = {
@@ -534,18 +554,53 @@ def translate_best(text: str, source_code: str, target_code: str) -> tuple[str, 
         return translated, "argos-fallback", pivot
 
 
-def preload_argos_models() -> None:
+def preload_argos_models(pairs_csv: Optional[str] = None) -> list[ArgosPreloadResult]:
+    results: list[ArgosPreloadResult] = []
     if not AUTO_INSTALL_MODELS:
-        return
-    for item in PRELOAD_LANGUAGE_PAIRS.split(","):
+        return [
+            ArgosPreloadResult(
+                pair="",
+                installed=False,
+                status="disabled",
+                detail="AUTO_INSTALL_MODELS is false.",
+            )
+        ]
+    for item in (pairs_csv or PRELOAD_LANGUAGE_PAIRS).split(","):
         pair = item.strip()
         if not pair or ":" not in pair:
             continue
         source_code, target_code = pair.split(":", 1)
+        source_code = source_code.strip()
+        target_code = target_code.strip()
         try:
-            install_pair_if_available(source_code.strip(), target_code.strip())
+            installed = install_pair_if_available(source_code, target_code)
+            results.append(
+                ArgosPreloadResult(
+                    pair=f"{source_code}:{target_code}",
+                    installed=installed,
+                    status="installed" if installed else "unavailable",
+                    detail="" if installed else "No Argos package exists for this direct pair.",
+                )
+            )
         except Exception as error:
             print(f"Argos model preload skipped for {pair}: {error}", flush=True)
+            results.append(
+                ArgosPreloadResult(
+                    pair=f"{source_code}:{target_code}",
+                    installed=False,
+                    status="error",
+                    detail=str(error),
+                )
+            )
+    return results
+
+
+def suggested_argos_pairs(source_code: str, target_code: str) -> str:
+    if source_code == target_code:
+        return ""
+    if source_code == "en" or target_code == "en":
+        return f"{source_code}:{target_code}"
+    return f"{source_code}:en,en:{target_code}"
 
 
 def installed_argos_pairs() -> list[str]:
@@ -597,6 +652,17 @@ def health() -> dict:
     }
 
 
+@app.get("/argos/preload")
+def preload_argos_endpoint(pairs: Optional[str] = None) -> dict:
+    results = preload_argos_models(pairs)
+    return {
+        "ok": True,
+        "requestedPairs": pairs or PRELOAD_LANGUAGE_PAIRS,
+        "results": [result.dict() for result in results],
+        "installedArgosPairs": installed_argos_pairs(),
+    }
+
+
 @app.post("/translate", response_model=TranslateResponse)
 def translate(request: TranslateRequest) -> TranslateResponse:
     source_text = request.text or request.sourceText or ""
@@ -605,6 +671,8 @@ def translate(request: TranslateRequest) -> TranslateResponse:
     max_words = request.maxOutputWords or 80
 
     clean = clean_text(source_text, max_words=max_words)
+    if TRANSLATION_PROVIDER == "argos":
+        preload_argos_models(suggested_argos_pairs(source_code, target_code))
     translated, provider, pivot = translate_best(clean, source_code, target_code)
 
     return TranslateResponse(
