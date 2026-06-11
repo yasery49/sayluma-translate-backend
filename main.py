@@ -15,7 +15,7 @@ import argostranslate.translate
 
 app = FastAPI(title="SayLuma Translation Backend", version="2.1.0")
 
-TRANSLATION_PROVIDER = os.getenv("TRANSLATION_PROVIDER", "marian").strip().lower()
+TRANSLATION_PROVIDER = os.getenv("TRANSLATION_PROVIDER", "argos").strip().lower()
 ALLOW_ARGOS_FALLBACK = os.getenv("ALLOW_ARGOS_FALLBACK", "true").lower() == "true"
 
 MARIAN_DEVICE = os.getenv("MARIAN_DEVICE", "cpu").strip().lower()
