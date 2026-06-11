@@ -2,6 +2,7 @@ import os
 import re
 import threading
 import unicodedata
+from collections import OrderedDict
 from functools import lru_cache
 from typing import Optional
 
@@ -12,10 +13,18 @@ import argostranslate.package
 import argostranslate.translate
 
 
-app = FastAPI(title="SayLuma Translation Backend", version="2.0.0")
+app = FastAPI(title="SayLuma Translation Backend", version="2.1.0")
 
-TRANSLATION_PROVIDER = os.getenv("TRANSLATION_PROVIDER", "m2m100").strip().lower()
+TRANSLATION_PROVIDER = os.getenv("TRANSLATION_PROVIDER", "marian").strip().lower()
 ALLOW_ARGOS_FALLBACK = os.getenv("ALLOW_ARGOS_FALLBACK", "true").lower() == "true"
+
+MARIAN_DEVICE = os.getenv("MARIAN_DEVICE", "cpu").strip().lower()
+MARIAN_NUM_BEAMS = int(os.getenv("MARIAN_NUM_BEAMS", "4"))
+MARIAN_MAX_INPUT_TOKENS = int(os.getenv("MARIAN_MAX_INPUT_TOKENS", "256"))
+MARIAN_MAX_NEW_TOKENS = int(os.getenv("MARIAN_MAX_NEW_TOKENS", "180"))
+MARIAN_MAX_CACHED_MODELS = int(os.getenv("MARIAN_MAX_CACHED_MODELS", "1"))
+MARIAN_EN_TR_MODEL = os.getenv("MARIAN_EN_TR_MODEL", "Helsinki-NLP/opus-mt-en-trk")
+MARIAN_EN_TR_PREFIX = os.getenv("MARIAN_EN_TR_PREFIX", ">>tur<<")
 
 M2M100_MODEL_NAME = os.getenv("M2M100_MODEL", "facebook/m2m100_418M")
 M2M100_DEVICE = os.getenv("M2M100_DEVICE", "cpu").strip().lower()
@@ -39,6 +48,11 @@ _m2m_tokenizer = None
 _m2m_model = None
 _m2m_torch = None
 _m2m_device = "cpu"
+
+_marian_lock = threading.RLock()
+_marian_models: OrderedDict[str, tuple[object, object]] = OrderedDict()
+_marian_torch = None
+_marian_device = "cpu"
 
 
 class TranslateRequest(BaseModel):
@@ -373,10 +387,139 @@ def translate_with_m2m100(text: str, source_code: str, target_code: str) -> str:
     return re.sub(r"\s+", " ", " ".join(translated_segments)).strip()
 
 
+def marian_model_for_pair(source_code: str, target_code: str) -> tuple[str, str]:
+    if source_code == "en" and target_code == "tr":
+        return MARIAN_EN_TR_MODEL, MARIAN_EN_TR_PREFIX
+
+    direct_models = {
+        ("de", "en"): ("Helsinki-NLP/opus-mt-de-en", ""),
+        ("en", "de"): ("Helsinki-NLP/opus-mt-en-de", ""),
+        ("es", "en"): ("Helsinki-NLP/opus-mt-es-en", ""),
+        ("en", "es"): ("Helsinki-NLP/opus-mt-en-es", ""),
+        ("it", "en"): ("Helsinki-NLP/opus-mt-it-en", ""),
+        ("en", "it"): ("Helsinki-NLP/opus-mt-en-it", ""),
+        ("fr", "en"): ("Helsinki-NLP/opus-mt-fr-en", ""),
+        ("en", "fr"): ("Helsinki-NLP/opus-mt-en-fr", ""),
+        ("ru", "en"): ("Helsinki-NLP/opus-mt-ru-en", ""),
+        ("en", "ru"): ("Helsinki-NLP/opus-mt-en-ru", ""),
+        ("tr", "en"): ("Helsinki-NLP/opus-mt-tr-en", ""),
+    }
+    model = direct_models.get((source_code, target_code))
+    if model is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"No Marian direct model configured: {source_code}->{target_code}",
+        )
+    return model
+
+
+def marian_route(source_code: str, target_code: str) -> list[tuple[str, str]]:
+    if source_code == target_code:
+        return []
+    if source_code == "en" or target_code == "en":
+        return [(source_code, target_code)]
+    return [(source_code, "en"), ("en", target_code)]
+
+
+def load_marian_model(model_name: str) -> tuple[object, object]:
+    global _marian_torch, _marian_device
+
+    with _marian_lock:
+        cached = _marian_models.get(model_name)
+        if cached is not None:
+            _marian_models.move_to_end(model_name)
+            return cached
+
+        try:
+            import torch
+            from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+        except Exception as error:
+            raise RuntimeError(f"Marian dependencies are not installed: {error}") from error
+
+        if TORCH_NUM_THREADS > 0:
+            torch.set_num_threads(TORCH_NUM_THREADS)
+
+        if MARIAN_DEVICE == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            device = MARIAN_DEVICE
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+        model.to(device)
+        model.eval()
+
+        while len(_marian_models) >= max(1, MARIAN_MAX_CACHED_MODELS):
+            _, (_, old_model) = _marian_models.popitem(last=False)
+            del old_model
+
+        _marian_models[model_name] = (tokenizer, model)
+        _marian_torch = torch
+        _marian_device = device
+        return tokenizer, model
+
+
+def translate_segment_marian(text: str, source_code: str, target_code: str) -> str:
+    model_name, target_prefix = marian_model_for_pair(source_code, target_code)
+    tokenizer, model = load_marian_model(model_name)
+    torch = _marian_torch
+
+    source_text = f"{target_prefix} {text}".strip() if target_prefix else text
+
+    with _marian_lock:
+        encoded = tokenizer(
+            source_text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=MARIAN_MAX_INPUT_TOKENS,
+        )
+        encoded = {key: value.to(_marian_device) for key, value in encoded.items()}
+
+        with torch.no_grad():
+            generated_tokens = model.generate(
+                **encoded,
+                max_new_tokens=MARIAN_MAX_NEW_TOKENS,
+                num_beams=MARIAN_NUM_BEAMS,
+                no_repeat_ngram_size=3,
+                early_stopping=True,
+            )
+        translated = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0].strip()
+
+    if not translated:
+        raise HTTPException(status_code=502, detail="Marian returned an empty result.")
+    return translated
+
+
+def translate_with_marian(text: str, source_code: str, target_code: str) -> str:
+    if source_code == target_code:
+        return text
+
+    current_segments = split_for_translation(text)
+    for route_source, route_target in marian_route(source_code, target_code):
+        current_segments = [
+            translate_segment_marian(segment, route_source, route_target)
+            for segment in current_segments
+        ]
+    return re.sub(r"\s+", " ", " ".join(current_segments)).strip()
+
+
 def translate_best(text: str, source_code: str, target_code: str) -> tuple[str, str, Optional[str]]:
     if TRANSLATION_PROVIDER == "argos":
         translated, pivot = translate_with_argos_pivot(text, source_code, target_code)
         return translated, "argos", pivot
+
+    if TRANSLATION_PROVIDER == "marian":
+        try:
+            translated = translate_with_marian(text, source_code, target_code)
+            return translated, "marian", "en" if source_code != "en" and target_code != "en" else None
+        except Exception as error:
+            if not ALLOW_ARGOS_FALLBACK:
+                if isinstance(error, HTTPException):
+                    raise error
+                raise HTTPException(status_code=503, detail=f"Marian translation failed: {error}") from error
+            print(f"Marian failed, falling back to Argos: {error}", flush=True)
+            translated, pivot = translate_with_argos_pivot(text, source_code, target_code)
+            return translated, "argos-fallback", pivot
 
     try:
         translated = translate_with_m2m100(text, source_code, target_code)
@@ -407,6 +550,12 @@ def preload_argos_models() -> None:
 
 @app.on_event("startup")
 def on_startup() -> None:
+    if os.getenv("PRELOAD_MARIAN_ON_STARTUP", "false").lower() == "true":
+        try:
+            load_marian_model("Helsinki-NLP/opus-mt-de-en")
+            load_marian_model(MARIAN_EN_TR_MODEL)
+        except Exception as error:
+            print(f"Marian preload skipped: {error}", flush=True)
     if os.getenv("PRELOAD_M2M100_ON_STARTUP", "false").lower() == "true":
         try:
             load_m2m100()
@@ -418,10 +567,18 @@ def on_startup() -> None:
 
 @app.get("/health")
 def health() -> dict:
+    if TRANSLATION_PROVIDER == "argos":
+        model_name = "argos"
+    elif TRANSLATION_PROVIDER == "marian":
+        model_name = "opus-mt Marian route"
+    else:
+        model_name = M2M100_MODEL_NAME
+
     return {
         "ok": True,
         "provider": TRANSLATION_PROVIDER,
-        "model": M2M100_MODEL_NAME if TRANSLATION_PROVIDER != "argos" else "argos",
+        "model": model_name,
+        "marianLoadedModels": list(_marian_models.keys()),
         "m2m100Loaded": _m2m_model is not None,
         "argosFallback": ALLOW_ARGOS_FALLBACK,
         "autoInstallArgosModels": AUTO_INSTALL_MODELS,
