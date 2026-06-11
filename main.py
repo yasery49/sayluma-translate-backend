@@ -548,6 +548,17 @@ def preload_argos_models() -> None:
             print(f"Argos model preload skipped for {pair}: {error}", flush=True)
 
 
+def installed_argos_pairs() -> list[str]:
+    pairs: list[str] = []
+    try:
+        for source_language in argostranslate.translate.get_installed_languages():
+            for target_language in source_language.translations_from:
+                pairs.append(f"{source_language.code}:{target_language.code}")
+    except Exception as error:
+        print(f"Installed Argos pair check failed: {error}", flush=True)
+    return sorted(set(pairs))
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     if os.getenv("PRELOAD_MARIAN_ON_STARTUP", "false").lower() == "true":
@@ -582,6 +593,7 @@ def health() -> dict:
         "m2m100Loaded": _m2m_model is not None,
         "argosFallback": ALLOW_ARGOS_FALLBACK,
         "autoInstallArgosModels": AUTO_INSTALL_MODELS,
+        "installedArgosPairs": installed_argos_pairs(),
     }
 
 
